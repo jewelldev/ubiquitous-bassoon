@@ -1,3 +1,4 @@
 document.getElementById("helloBtn").addEventListener("click", () => {
-  alert("Hello");
+  const name = document.getElementById("nameInput").value.trim();
+  alert(name ? `Hello, ${name}` : "Hello");
 });
