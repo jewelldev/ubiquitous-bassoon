@@ -1,0 +1,162 @@
+name: Claude Bug Fixer
+
+on:
+  # Production trigger: ADO Service Hook → Logic App → GitHub repository_dispatch
+  repository_dispatch:
+    types: [claude-fix]
+
+  # Manual trigger for testing (no ADO wiring required):
+  #   gh workflow run claude-bugfix.yml -f workitem_id=123
+  workflow_dispatch:
+    inputs:
+      workitem_id:
+        description: 'ADO Work Item ID'
+        required: true
+
+jobs:
+  fix-bug:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Resolve workitem ID from whichever trigger fired ────────────────────
+      - name: Resolve workitem ID
+        id: resolve
+        run: |
+          ID="${{ github.event.client_payload.workitem_id }}${{ inputs.workitem_id }}"
+          echo "workitem_id=${ID}" >> $GITHUB_OUTPUT
+
+      # ── Fetch bug details from ADO REST API ─────────────────────────────────
+      - name: Fetch ADO workitem
+        id: workitem
+        env:
+          ADO_PAT: ${{ secrets.ADO_PAT }}
+          ADO_ORG: ${{ secrets.ADO_ORG }}
+          ADO_PROJECT: ${{ secrets.ADO_PROJECT }}
+        run: |
+          ID="${{ steps.resolve.outputs.workitem_id }}"
+
+          RESPONSE=$(curl -sf \
+            -u ":${ADO_PAT}" \
+            "https://dev.azure.com/${ADO_ORG}/${ADO_PROJECT}/_apis/wit/workItems/${ID}?api-version=7.1")
+
+          TAGS=$(echo "$RESPONSE" | jq -r '.fields["System.Tags"] // ""')
+
+          # Guard: tag may have been removed by the time this runs
+          if ! echo "$TAGS" | grep -qi "claude-fix"; then
+            echo "Workitem ${ID} no longer has 'claude-fix' tag — skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          TITLE=$(echo "$RESPONSE" | jq -r '.fields["System.Title"]')
+          DESC=$(echo "$RESPONSE" \
+            | jq -r '.fields["System.Description"] // .fields["Microsoft.VSTS.TCM.ReproSteps"] // ""' \
+            | sed 's/<[^>]*>//g; s/&nbsp;/ /g; s/&amp;/\&/g')
+
+          echo "title=${TITLE}" >> $GITHUB_OUTPUT
+          echo "tags=${TAGS}"   >> $GITHUB_OUTPUT
+          {
+            echo "description<<ENDDESC"
+            echo "$DESC"
+            echo "ENDDESC"
+          } >> $GITHUB_OUTPUT
+
+      # ── Create branch ────────────────────────────────────────────────────────
+      - name: Create branch
+        if: steps.workitem.outputs.skip != 'true'
+        run: |
+          git config user.email "claude-bot@users.noreply.github.com"
+          git config user.name "Claude Bug Fixer"
+          git checkout -B "claude/bug/${{ steps.resolve.outputs.workitem_id }}"
+
+      # ── Optional: install Playwright for UI bug verification ─────────────────
+      # Runs only when the workitem description/tags mention UI-related terms.
+      - name: Detect UI bug
+        id: ui
+        if: steps.workitem.outputs.skip != 'true'
+        run: |
+          COMBINED="${{ steps.workitem.outputs.description }} ${{ steps.workitem.outputs.tags }}"
+          if echo "$COMBINED" | grep -qiE "ui|visual|layout|style|screenshot|button|form|render|page|css|nav|menu|modal|dialog"; then
+            echo "is_ui=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_ui=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install Playwright + Chromium
+        if: steps.workitem.outputs.skip != 'true' && steps.ui.outputs.is_ui == 'true'
+        run: npx playwright install --with-deps chromium
+
+      # ── Run Claude ───────────────────────────────────────────────────────────
+      - name: Run Claude Code
+        if: steps.workitem.outputs.skip != 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --allowedTools "Read,Write,Edit,Glob,Grep,
+            Bash(dotnet *),
+            Bash(git add *),Bash(git commit *),Bash(git push *),
+            Bash(ls *),Bash(find *),Bash(cat *),Bash(grep *),Bash(sleep *),
+            mcp__playwright__browser_navigate,
+            mcp__playwright__browser_take_screenshot,
+            mcp__playwright__browser_click,
+            mcp__playwright__browser_snapshot,
+            mcp__playwright__browser_fill_form,
+            mcp__playwright__browser_type,
+            mcp__playwright__browser_wait_for"
+            --max-turns 30
+          prompt: |
+            You are an automated bug-fixer for a .NET 10 Blazor WebAssembly application.
+
+            ## Bug Report — ADO Work Item #${{ steps.resolve.outputs.workitem_id }}
+
+            **Title:** ${{ steps.workitem.outputs.title }}
+
+            **Description:**
+            ${{ steps.workitem.outputs.description }}
+
+            ---
+
+            ## Instructions
+
+            1. Read CLAUDE.md for project structure and build commands.
+            2. Find and fix the bug. Change only files necessary for this fix.
+            3. Verify: `dotnet build src/BlazorWasmApp/BlazorWasmApp/BlazorWasmApp.csproj`
+               Fix any build errors before continuing.
+            ${{ steps.ui.outputs.is_ui == 'true' && '
+            4. This appears to be a UI bug. Start the dev server:
+                 dotnet run --project src/BlazorWasmApp/BlazorWasmApp/BlazorWasmApp.csproj \
+                   --urls http://localhost:5153 &
+               Wait 12 seconds, then navigate to http://localhost:5153 with Playwright
+               and take a screenshot to visually confirm the fix.
+            ' || '' }}
+            5. Commit: `git add -A && git commit -m "fix: ${{ steps.workitem.outputs.title }} (AB#${{ steps.resolve.outputs.workitem_id }})"`
+            6. Push: `git push origin claude/bug/${{ steps.resolve.outputs.workitem_id }}`
+
+            Do NOT create a pull request — the workflow handles that after you exit.
+
+      # ── Open PR with AB# link for Azure Boards auto-linking ─────────────────
+      - name: Create pull request
+        if: steps.workitem.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --head "claude/bug/${{ steps.resolve.outputs.workitem_id }}" \
+            --base main \
+            --title "fix(claude): ${{ steps.workitem.outputs.title }}" \
+            --body "## Automated fix — ADO Work Item #${{ steps.resolve.outputs.workitem_id }}
+
+          **${{ steps.workitem.outputs.title }}**
+
+          This pull request was automatically generated by the Claude Bug Fixer workflow.
+
+          Closes AB#${{ steps.resolve.outputs.workitem_id }}"

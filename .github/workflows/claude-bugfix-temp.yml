@@ -60,8 +60,6 @@ jobs:
 
       # ── Step 2: Ask Claude to analyse the bug and explain its plan ──────────
       # Read-only — no file edits, no commits. Just shows Claude's reasoning.
-      # The full turn-by-turn conversation is visible in the step log above.
-      # The final response is also written to the job summary (Actions → Summary).
       - name: Claude analysis (read-only)
         id: claude
         uses: anthropics/claude-code-action@v1
@@ -92,7 +90,28 @@ jobs:
                - Exactly what change you would make to fix it
                - Whether a build-only verify is sufficient or if Playwright UI testing would be needed
 
-      # ── Step 3: Write Claude's analysis to the job summary ─────────────────
+      # ── Step 3: Extract Claude's output from the saved log file ────────────
+      # The action saves full results to a temp file but doesn't always set the
+      # output variable reliably in workflow_dispatch mode. Read it directly.
+      - name: Extract Claude output
+        id: extract
+        if: always()
+        run: |
+          OUTPUT_FILE="/home/runner/work/_temp/claude-execution-output.json"
+          if [ -f "$OUTPUT_FILE" ]; then
+            echo "=== Claude output file contents ==="
+            cat "$OUTPUT_FILE" | jq .
+            ANALYSIS=$(jq -r '.result // ""' "$OUTPUT_FILE")
+            {
+              echo "analysis<<ENDANALYSIS"
+              echo "$ANALYSIS"
+              echo "ENDANALYSIS"
+            } >> $GITHUB_OUTPUT
+          else
+            echo "Output file not found at $OUTPUT_FILE"
+          fi
+
+      # ── Step 4: Write Claude's analysis to the job summary ─────────────────
       - name: Write analysis to job summary
         if: always()
         run: |
@@ -101,20 +120,18 @@ jobs:
             echo ""
             echo "**${{ steps.workitem.outputs.title }}**"
             echo ""
-            echo "${{ steps.claude.outputs.output }}"
+            echo "${{ steps.extract.outputs.analysis }}"
           } >> $GITHUB_STEP_SUMMARY
 
-      # ── Step 4: Post analysis as a comment on the ADO workitem ──────────────
+      # ── Step 5: Post analysis as a comment on the ADO workitem ──────────────
       # Requires ADO_PAT to have Work Items — Read & Write scope.
-      # Uses an env var + jq to safely encode the text as JSON (handles special
-      # characters in Claude's output without breaking the request body).
       - name: Comment on ADO workitem
-        if: steps.claude.outputs.output != ''
+        if: steps.extract.outputs.analysis != ''
         env:
           ADO_PAT: ${{ secrets.ADO_PAT }}
           ADO_ORG: ${{ secrets.ADO_ORG }}
           ADO_PROJECT: ${{ secrets.ADO_PROJECT }}
-          CLAUDE_OUTPUT: ${{ steps.claude.outputs.output }}
+          CLAUDE_OUTPUT: ${{ steps.extract.outputs.analysis }}
         run: |
           ID="${{ steps.workitem.outputs.workitem_id }}"
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
