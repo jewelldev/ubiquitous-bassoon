@@ -1,0 +1,43 @@
+name: Claude Bug Fixer (temp - step 1)
+
+on:
+  repository_dispatch:
+    types: [claude-fix]
+  workflow_dispatch:
+    inputs:
+      workitem_id:
+        description: 'ADO Work Item ID'
+        required: true
+
+jobs:
+  fetch-workitem:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch ADO workitem
+        env:
+          ADO_PAT: ${{ secrets.ADO_PAT }}
+          ADO_ORG: ${{ secrets.ADO_ORG }}
+          ADO_PROJECT: ${{ secrets.ADO_PROJECT }}
+        run: |
+          ID="${{ github.event.client_payload.workitem_id }}${{ inputs.workitem_id }}"
+
+          RESPONSE=$(curl -sf \
+            -u ":${ADO_PAT}" \
+            "https://dev.azure.com/${ADO_ORG}/${ADO_PROJECT}/_apis/wit/workItems/${ID}?api-version=7.1")
+
+          echo "=== Raw workitem fields ==="
+          echo "$RESPONSE" | jq '.fields'
+
+          echo ""
+          echo "=== Parsed values ==="
+          echo "Title:       $(echo "$RESPONSE" | jq -r '.fields["System.Title"]')"
+          echo "State:       $(echo "$RESPONSE" | jq -r '.fields["System.State"]')"
+          echo "Tags:        $(echo "$RESPONSE" | jq -r '.fields["System.Tags"] // "(none)"')"
+          echo "Type:        $(echo "$RESPONSE" | jq -r '.fields["System.WorkItemType"]')"
+
+          DESC=$(echo "$RESPONSE" \
+            | jq -r '.fields["System.Description"] // .fields["Microsoft.VSTS.TCM.ReproSteps"] // "(no description)"' \
+            | sed 's/<[^>]*>//g; s/&nbsp;/ /g; s/&amp;/\&/g')
+          echo ""
+          echo "Description:"
+          echo "$DESC"
