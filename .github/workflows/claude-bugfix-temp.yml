@@ -90,26 +90,30 @@ jobs:
                - Exactly what change you would make to fix it
                - Whether a build-only verify is sufficient or if Playwright UI testing would be needed
 
-      # ── Step 3: Extract Claude's output from the saved log file ────────────
-      # The action saves full results to a temp file but doesn't always set the
-      # output variable reliably in workflow_dispatch mode. Read it directly.
+      # ── Step 3: Extract Claude's output from the execution file ────────────
+      # The action sets execution_file to the path of the saved result JSON.
       - name: Extract Claude output
         id: extract
         if: always()
         run: |
-          OUTPUT_FILE="/home/runner/work/_temp/claude-execution-output.json"
-          if [ -f "$OUTPUT_FILE" ]; then
-            echo "=== Claude output file contents ==="
-            cat "$OUTPUT_FILE" | jq .
-            ANALYSIS=$(jq -r '.result // ""' "$OUTPUT_FILE")
-            {
-              echo "analysis<<ENDANALYSIS"
-              echo "$ANALYSIS"
-              echo "ENDANALYSIS"
-            } >> $GITHUB_OUTPUT
-          else
-            echo "Output file not found at $OUTPUT_FILE"
+          OUTPUT_FILE="${{ steps.claude.outputs.execution_file }}"
+
+          if [ -z "$OUTPUT_FILE" ] || [ ! -f "$OUTPUT_FILE" ]; then
+            echo "No execution file available (path: '${OUTPUT_FILE}')"
+            exit 0
           fi
+
+          echo "=== Execution file: $OUTPUT_FILE ==="
+          cat "$OUTPUT_FILE" | jq .
+
+          ANALYSIS=$(jq -r '.result // ""' "$OUTPUT_FILE")
+
+          {
+            echo "analysis<<ENDANALYSIS"
+            printf '%s' "$ANALYSIS"
+            echo ""
+            echo "ENDANALYSIS"
+          } >> $GITHUB_OUTPUT
 
       # ── Step 4: Write Claude's analysis to the job summary ─────────────────
       - name: Write analysis to job summary
