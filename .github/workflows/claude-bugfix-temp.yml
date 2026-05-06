@@ -12,8 +12,15 @@ on:
 jobs:
   fetch-workitem:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      - uses: actions/checkout@v4
+
+      # ── Step 1: Fetch workitem from ADO and print what we got ───────────────
       - name: Fetch ADO workitem
+        id: workitem
         env:
           ADO_PAT: ${{ secrets.ADO_PAT }}
           ADO_ORG: ${{ secrets.ADO_ORG }}
@@ -41,3 +48,87 @@ jobs:
           echo ""
           echo "Description:"
           echo "$DESC"
+
+          # Save for Claude step
+          echo "workitem_id=${ID}" >> $GITHUB_OUTPUT
+          echo "title=$(echo "$RESPONSE" | jq -r '.fields["System.Title"]')" >> $GITHUB_OUTPUT
+          {
+            echo "description<<ENDDESC"
+            echo "$DESC"
+            echo "ENDDESC"
+          } >> $GITHUB_OUTPUT
+
+      # ── Step 2: Ask Claude to analyse the bug and explain its plan ──────────
+      # Read-only — no file edits, no commits. Just shows Claude's reasoning.
+      # The full turn-by-turn conversation is visible in the step log above.
+      # The final response is also written to the job summary (Actions → Summary).
+      - name: Claude analysis (read-only)
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --allowedTools "Read,Glob,Grep,Bash(ls *),Bash(find *),Bash(cat *),Bash(dotnet build *)"
+            --max-turns 10
+          prompt: |
+            You are reviewing a bug report to plan a fix. Do NOT edit any files or run git commands.
+
+            ## Bug Report — ADO Work Item #${{ steps.workitem.outputs.workitem_id }}
+
+            **Title:** ${{ steps.workitem.outputs.title }}
+
+            **Description:**
+            ${{ steps.workitem.outputs.description }}
+
+            ---
+
+            Please:
+            1. Read CLAUDE.md to understand the project.
+            2. Explore the codebase to find the code relevant to this bug.
+            3. Explain in plain English:
+               - Which file(s) are involved
+               - What the likely root cause is
+               - Exactly what change you would make to fix it
+               - Whether a build-only verify is sufficient or if Playwright UI testing would be needed
+
+      # ── Step 3: Write Claude's analysis to the job summary ─────────────────
+      - name: Write analysis to job summary
+        if: always()
+        run: |
+          {
+            echo "## Claude Bug Analysis — ADO #${{ steps.workitem.outputs.workitem_id }}"
+            echo ""
+            echo "**${{ steps.workitem.outputs.title }}**"
+            echo ""
+            echo "${{ steps.claude.outputs.output }}"
+          } >> $GITHUB_STEP_SUMMARY
+
+      # ── Step 4: Post analysis as a comment on the ADO workitem ──────────────
+      # Requires ADO_PAT to have Work Items — Read & Write scope.
+      # Uses an env var + jq to safely encode the text as JSON (handles special
+      # characters in Claude's output without breaking the request body).
+      - name: Comment on ADO workitem
+        if: steps.claude.outputs.output != ''
+        env:
+          ADO_PAT: ${{ secrets.ADO_PAT }}
+          ADO_ORG: ${{ secrets.ADO_ORG }}
+          ADO_PROJECT: ${{ secrets.ADO_PROJECT }}
+          CLAUDE_OUTPUT: ${{ steps.claude.outputs.output }}
+        run: |
+          ID="${{ steps.workitem.outputs.workitem_id }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Build comment body as HTML (ADO comments render HTML)
+          BODY="<b>🤖 Claude Bug Analysis</b><br><br>${CLAUDE_OUTPUT//$'\n'/<br>}<br><br><i>Full analysis: <a href=\"${RUN_URL}\">GitHub Actions run</a></i>"
+
+          # jq --arg safely escapes the text for JSON
+          jq -n --arg text "$BODY" '{"text": $text}' > /tmp/comment.json
+
+          curl -sf \
+            -X POST \
+            -u ":${ADO_PAT}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/comment.json \
+            "https://dev.azure.com/${ADO_ORG}/${ADO_PROJECT}/_apis/wit/workItems/${ID}/comments?api-version=7.1-preview.3"
+
+          echo "Comment posted to workitem ${ID}"
