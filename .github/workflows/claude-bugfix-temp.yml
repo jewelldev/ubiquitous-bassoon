@@ -91,29 +91,44 @@ jobs:
                - Whether a build-only verify is sufficient or if Playwright UI testing would be needed
 
       # ── Step 3: Extract Claude's output from the execution file ────────────
-      # The action sets execution_file to the path of the saved result JSON.
       - name: Extract Claude output
         id: extract
         if: always()
         run: |
+          set +e  # never fail this step — we want to see what goes wrong
+
           OUTPUT_FILE="${{ steps.claude.outputs.execution_file }}"
+          echo "execution_file output: '${OUTPUT_FILE}'"
+
+          echo "--- ls _temp ---"
+          ls -la "$RUNNER_TEMP/" 2>&1
+          echo "exit: $?"
 
           if [ -z "$OUTPUT_FILE" ] || [ ! -f "$OUTPUT_FILE" ]; then
-            echo "No execution file available (path: '${OUTPUT_FILE}')"
+            echo "File not found or path empty — skipping"
             exit 0
           fi
 
-          echo "=== Execution file: $OUTPUT_FILE ==="
-          cat "$OUTPUT_FILE" | jq .
+          echo "--- raw file ---"
+          cat "$OUTPUT_FILE"
+          echo "cat exit: $?"
 
+          echo "--- jq parse test ---"
+          jq '.' "$OUTPUT_FILE" > /dev/null
+          echo "jq exit: $?"
+
+          echo "--- extract result field ---"
           ANALYSIS=$(jq -r '.result // ""' "$OUTPUT_FILE")
+          echo "jq extract exit: $?"
+          echo "analysis length: ${#ANALYSIS}"
 
+          echo "--- write to GITHUB_OUTPUT ---"
           {
             echo "analysis<<ENDANALYSIS"
-            printf '%s' "$ANALYSIS"
-            echo ""
+            printf '%s\n' "$ANALYSIS"
             echo "ENDANALYSIS"
-          } >> $GITHUB_OUTPUT
+          } >> "$GITHUB_OUTPUT"
+          echo "write exit: $?"
 
       # ── Step 4: Write Claude's analysis to the job summary ─────────────────
       - name: Write analysis to job summary
