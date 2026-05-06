@@ -118,7 +118,7 @@ jobs:
           echo "jq exit: $?"
 
           echo "--- extract result field ---"
-          ANALYSIS=$(jq -r '.result // ""' "$OUTPUT_FILE")
+          ANALYSIS=$(jq -r '.[] | select(.type == "result") | .result // ""' "$OUTPUT_FILE")
           echo "jq extract exit: $?"
           echo "analysis length: ${#ANALYSIS}"
 
